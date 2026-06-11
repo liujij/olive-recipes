@@ -2,7 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: MIT
 # -------------------------------------------------------------------------
-# Export FLUX.2-klein-4B sub-models to ONNX via Olive.
+# Export FLUX.2-klein-4B sub-models to ONNX for Ryzen AI.
 #
 # Usage:
 #   python export_models.py [--models transformer vae_decoder text_encoder]
@@ -14,11 +14,12 @@
 #   output_model/
 #     transformer/dd/replaced.onnx   NPU (RyzenAI)
 #     vae_decoder/dd/replaced.onnx   NPU (RyzenAI)
-#     text_encoder/model.onnx        CPU ONNX
+#     text_encoder/model.onnx        CPU ONNX (prompt_embeds, MatMulNBits INT4)
 #     tokenizer/                     from pipeline
 #     scheduler/                     from pipeline
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -30,11 +31,15 @@ from olive.workflows import run as olive_run
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
-DEFAULT_MODEL_ID   = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_MODEL_ID = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_RESOLUTIONS = ["1024x1024"]
 ALL_MODELS = ["transformer", "vae_decoder", "text_encoder"]
 
 NON_ONNX_COMPONENTS = ["tokenizer", "tokenizer_2", "scheduler", "feature_extractor"]
+
+STAGED_DIR = SCRIPT_DIR / "staged"
+STAGING_MARKER = ".staged_from"
+TEXT_ENCODER_WEIGHT_GLOBS = ("*.safetensors", "*.json")
 
 
 def set_dd_env() -> None:
@@ -64,18 +69,194 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{s}s"
 
 
-def update_config_files(model_id: str | None, resolutions: list[str] | None) -> None:
-    for name in ALL_MODELS:
-        config_path = SCRIPT_DIR / f"config_{name}.json"
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Symlink large weight files when possible; fall back to copy."""
+    if dst.exists() or dst.is_symlink():
+        dst.unlink()
+    try:
+        os.symlink(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _staging_dir_for_pipeline(pipeline_root: Path) -> Path:
+    digest = hashlib.sha256(str(pipeline_root).encode()).hexdigest()[:12]
+    return STAGED_DIR / f"text_encoder_{digest}"
+
+
+def resolve_pipeline_root(model_id: str | Path) -> Path:
+    """Return the diffusers pipeline root for Flux2KleinPipeline loading."""
+    path = Path(model_id).resolve()
+    if (path / "model_index.json").exists():
+        return path
+    if (path / "text_encoder" / "config.json").exists():
+        return path
+
+    marker = path / STAGING_MARKER
+    if marker.exists():
+        return Path(marker.read_text(encoding="utf-8").strip())
+
+    raise ValueError(
+        f"Cannot resolve diffusers pipeline root from '{path}'. "
+        "Pass --model_id pointing to the FLUX.2-klein-4B pipeline directory."
+    )
+
+
+def stage_text_encoder_bundle(pipeline_root: str | Path) -> Path:
+    """Assemble text_encoder weights + tokenizer into one HF-style directory.
+
+    Diffusers pipelines keep ``text_encoder/`` and ``tokenizer/`` as siblings.
+    ModelBuilder expects a single checkpoint directory with ``config.json``,
+    weight shards, and tokenizer files together.
+    """
+    pipeline_root = Path(pipeline_root).resolve()
+    text_encoder_src = pipeline_root / "text_encoder"
+    tokenizer_src = pipeline_root / "tokenizer"
+
+    if not text_encoder_src.is_dir():
+        raise FileNotFoundError(f"Missing text_encoder directory: {text_encoder_src}")
+    if not (text_encoder_src / "config.json").exists():
+        raise FileNotFoundError(f"Missing text_encoder config: {text_encoder_src / 'config.json'}")
+    if not tokenizer_src.is_dir():
+        raise FileNotFoundError(f"Missing tokenizer directory: {tokenizer_src}")
+
+    dest = _staging_dir_for_pipeline(pipeline_root)
+    marker = dest / STAGING_MARKER
+    if marker.exists() and marker.read_text(encoding="utf-8").strip() == str(pipeline_root):
+        if (dest / "config.json").exists() and (dest / "tokenizer.json").exists():
+            print(f"  [STAGE] Reusing staged text_encoder bundle: {dest}")
+            return dest
+
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    for pattern in TEXT_ENCODER_WEIGHT_GLOBS:
+        for src_file in sorted(text_encoder_src.glob(pattern)):
+            if src_file.is_file():
+                _link_or_copy(src_file, dest / src_file.name)
+
+    for src_file in sorted(tokenizer_src.iterdir()):
+        if src_file.is_file():
+            _link_or_copy(src_file, dest / src_file.name)
+
+    marker.write_text(str(pipeline_root), encoding="utf-8")
+    print(f"  [STAGE] Assembled text_encoder bundle: {dest}")
+    return dest
+
+
+def prepare_text_encoder_for_export(pipeline_root: str | Path) -> Path:
+    """Stage a flat HF checkpoint directory for text encoder export."""
+    return stage_text_encoder_bundle(pipeline_root)
+
+
+def _write_text_encoder_footprint(footprint_dir: Path) -> None:
+    """Write a minimal footprint so assemble_output_dir can copy model.onnx."""
+    footprint_dir.mkdir(parents=True, exist_ok=True)
+    node_id = "matmulnbits_export"
+    footprint = {
+        node_id: {
+            "parent_model_id": None,
+            "model_id": node_id,
+            "model_config_data": {
+                "type": "onnxmodel",
+                "config": {
+                    "model_path": str(footprint_dir),
+                    "onnx_file_name": "model.onnx",
+                },
+            },
+            "from_pass": "onnxconversion",
+        }
+    }
+    with (footprint_dir / "footprint.json").open("w", encoding="utf-8") as f:
+        json.dump(footprint, f, indent=4)
+
+
+def _find_latest_model_onnx(search_root: Path) -> Path:
+    """Pick the most recently modified ``model.onnx`` under an output tree."""
+    candidates = list(search_root.rglob("model.onnx"))
+    if not candidates:
+        raise FileNotFoundError(f"No model.onnx found under {search_root}")
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _run_fp16_prompt_embed_modelbuilder(staged_model_dir: Path, run_config: Path) -> Path:
+    """Run ModelBuilder (fp16, prompt_embeds) and return path to ``model.onnx``."""
+    run_config = run_config.resolve()
+    if not run_config.is_file():
+        raise FileNotFoundError(f"ModelBuilder run config not found: {run_config}")
+
+    with run_config.open(encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    input_model = cfg.setdefault("input_model", {})
+    input_model["model_path"] = str(staged_model_dir.resolve())
+    load_kw = input_model.setdefault("load_kwargs", {})
+    load_kw.setdefault("trust_remote_code", True)
+
+    out_rel = cfg.get("output_dir", "footprints/text_encoder_fp16_mb")
+    out_dir = Path(out_rel)
+    if not out_dir.is_absolute():
+        out_dir = (SCRIPT_DIR / out_dir).resolve()
+    cfg["output_dir"] = str(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    sidecar = out_dir / "_export_models_fp16_run_config.json"
+    with sidecar.open("w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"  [FP16] ModelBuilder (prompt_embeds): effective config → {sidecar}")
+
+    olive_run(cfg)
+    fp16_onnx = _find_latest_model_onnx(out_dir)
+    print(f"  [FP16] ONNX: {fp16_onnx}")
+    return fp16_onnx
+
+
+def export_text_encoder_matmulnbits(staged_model_dir: Path) -> Path:
+    """Text encoder: ModelBuilder fp16 (recipe JSON) → MatMulNBits INT4."""
+    from text_encoder_matmulnbits import export_prompt_embeds_matmulnbits
+
+    recipe = (SCRIPT_DIR / "recipes" / "qwen3-4b-fp16-prompt-embeds-modelbuilder.json").resolve()
+    if not recipe.is_file():
+        raise FileNotFoundError(
+            f"Text encoder fp16 recipe not found: {recipe}. "
+            "Restore recipes/ in this package."
+        )
+    print(f"  [TEXT_ENCODER] Using fp16 recipe: {recipe}")
+    resolved_fp16 = _run_fp16_prompt_embed_modelbuilder(staged_model_dir, recipe)
+
+    footprint_dir = SCRIPT_DIR / "footprints" / "text_encoder"
+    output_onnx = footprint_dir / "model.onnx"
+    export_prompt_embeds_matmulnbits(staged_model_dir, output_onnx, fp16_onnx_path=resolved_fp16)
+    _write_text_encoder_footprint(footprint_dir)
+    return output_onnx
+
+
+def _config_paths_for_update(models: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    for name in models:
+        if name == "text_encoder":
+            continue
+        paths.append(SCRIPT_DIR / f"config_{name}.json")
+    return paths
+
+
+def update_config_files(
+    model_id: str | None,
+    resolutions: list[str] | None,
+    models: list[str],
+) -> None:
+    for config_path in _config_paths_for_update(models):
         if not config_path.exists():
             continue
         with config_path.open() as f:
             cfg = json.load(f)
 
         changed = False
-        if model_id is not None and cfg.get("input_model", {}).get("model_path") != model_id:
-            cfg["input_model"]["model_path"] = model_id
-            changed = True
+        if model_id is not None:
+            if cfg.get("input_model", {}).get("model_path") != model_id:
+                cfg["input_model"]["model_path"] = model_id
+                changed = True
         if resolutions is not None:
             for pass_cfg in cfg.get("passes", {}).values():
                 if "resolutions" in pass_cfg and pass_cfg["resolutions"] != resolutions:
@@ -89,10 +270,14 @@ def update_config_files(model_id: str | None, resolutions: list[str] | None) -> 
 
 
 def load_olive_config(submodel_name: str) -> dict:
+    """Load Olive workflow JSON for NPU sub-models (transformer, vae_decoder)."""
+    if submodel_name == "text_encoder":
+        raise ValueError(
+            "text_encoder is exported via ModelBuilder fp16 → MatMulNBits, not a static config JSON."
+        )
     config_path = SCRIPT_DIR / f"config_{submodel_name}.json"
-    with config_path.open() as f:
+    with config_path.open(encoding="utf-8") as f:
         return json.load(f)
-
 
 
 def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Path]:
@@ -104,18 +289,31 @@ def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Pat
         footprints = json.load(f)
 
     conversion_node = None
-    optimized_node  = None
+    optimized_node = None
+    modelbuilder_node = None
     for node in footprints.values():
         from_pass = (node.get("from_pass") or "").lower()
         if from_pass == "onnxconversion":
             conversion_node = node
+        elif from_pass == "modelbuilder":
+            modelbuilder_node = node
         else:
             optimized_node = node
 
     if conversion_node is None:
-        raise RuntimeError(
-            f"OnnxConversion footprint node not found for '{submodel_name}' in {fp_path}."
-        )
+        if modelbuilder_node is not None:
+            conversion_node = modelbuilder_node
+            optimized_node = modelbuilder_node
+        elif optimized_node is not None:
+            print(
+                f"  [WARN] OnnxConversion footprint node not found for '{submodel_name}'; "
+                "using last optimization pass output."
+            )
+            conversion_node = optimized_node
+        else:
+            raise RuntimeError(
+                f"OnnxConversion footprint node not found for '{submodel_name}' in {fp_path}."
+            )
     # CPU-only models (text_encoder, vae_encoder) have no optimization pass;
     # the conversion output is the final artifact.
     if optimized_node is None:
@@ -133,7 +331,7 @@ def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Pat
 
 _PIPELINE_COMPONENT_MAP = {
     "transformer": "transformer",
-    "vae":         ["vae_encoder", "vae_decoder"],   # VAE covers both encoder & decoder
+    "vae": ["vae_encoder", "vae_decoder"],  # VAE covers both encoder & decoder
     "text_encoder": "text_encoder",
 }
 
@@ -183,7 +381,7 @@ def _save_vae_decoder_bn_stats(pipeline, output_dir: Path) -> None:
 
     tensors = {
         "bn.running_mean": running_mean.detach().to(torch.bfloat16),
-        "bn.running_var":  running_var.detach().to(torch.bfloat16),
+        "bn.running_var": running_var.detach().to(torch.bfloat16),
     }
     save_file(tensors, str(dst))
     print(f"  [SAVE]  vae_decoder/bn.running_x.safetensors  ({prefix}, shape {list(running_mean.shape)})")
@@ -267,7 +465,7 @@ def assemble_output_dir(
                 break
         else:
             dd_src = None
-        
+
         if dd_src is not None:
             dst_path = dst_dir / ("dd" if dd_src.name == "dd" else "dynamic" / "dd")
             shutil.rmtree(dst_dir, ignore_errors=True)
@@ -311,31 +509,41 @@ def assemble_output_dir(
 
 
 def optimize(args) -> dict[str, bool]:
-    model_id   = args.model_id
+    model_id = args.model_id
     output_dir = Path(args.output_dir).resolve()
 
     print(f"\n[PIPELINE] Loading Flux2KleinPipeline from '{model_id}' ...")
     from diffusers import Flux2KleinPipeline
     pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
 
-    t_cfg   = pipeline.transformer.config
+    t_cfg = pipeline.transformer.config
     vae_cfg = pipeline.vae.config
-    print(f"  Transformer : in_channels={t_cfg.in_channels}, "
-          f"joint_attention_dim={t_cfg.joint_attention_dim}, "
-          f"num_layers={t_cfg.num_layers}")
-    print(f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
-          f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}")
+    print(
+        f"  Transformer : in_channels={t_cfg.in_channels}, "
+        f"joint_attention_dim={t_cfg.joint_attention_dim}, "
+        f"num_layers={t_cfg.num_layers}"
+    )
+    print(
+        f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
+        f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}"
+    )
 
     results: dict[str, bool] = {}
     total_t0 = time.monotonic()
 
     for submodel_name in args.models:
         print(f"\n{'=' * 60}\n  Exporting: {submodel_name}\n{'=' * 60}")
-        olive_config = load_olive_config(submodel_name)
         t0 = time.monotonic()
         try:
-            olive_run(olive_config)
-            success = True
+            if submodel_name == "text_encoder":
+                print("  text_encoder: ModelBuilder fp16 → MatMulNBits INT4 (genai)")
+                staged_path = prepare_text_encoder_for_export(resolve_pipeline_root(model_id))
+                export_text_encoder_matmulnbits(staged_path)
+                success = True
+            else:
+                olive_config = load_olive_config(submodel_name)
+                olive_run(olive_config)
+                success = True
         except Exception as exc:
             print(f"\n[ERROR] {submodel_name} export failed: {exc}")
             success = False
@@ -365,38 +573,51 @@ def optimize(args) -> dict[str, bool]:
 
 def parse_args(raw_args=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export FLUX.2-klein-4B sub-models to ONNX via Olive.",
+        description="Export FLUX.2-klein-4B sub-models to ONNX for Ryzen AI.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python export_models.py\n"
             "  python export_models.py --models transformer\n"
             "  python export_models.py --model_id /local/path/to/model\n"
+            "  python export_models.py --models text_encoder\n"
             "  python export_models.py --output_dir /data/flux2_klein_onnx"
         ),
     )
     parser.add_argument(
-        "--model_id", default=None, type=str,
+        "--model_id",
+        default=None,
+        type=str,
         help=(
             "HuggingFace model ID or local path. "
-            "When provided, writes back to all config_*.json. "
-            f"Default: value in config_*.json (initially '{DEFAULT_MODEL_ID}')."
+            "When provided, writes back to config_transformer.json and config_vae_decoder.json. "
+            f"Default: value in those configs (initially '{DEFAULT_MODEL_ID}'), "
+            "or '{DEFAULT_MODEL_ID}' when exporting text_encoder alone without --model_id."
         ),
     )
     parser.add_argument(
-        "--models", nargs="+", choices=ALL_MODELS, default=None, metavar="MODEL",
+        "--models",
+        nargs="+",
+        choices=ALL_MODELS,
+        default=None,
+        metavar="MODEL",
         help=f"Sub-models to export (default: all). Choices: {', '.join(ALL_MODELS)}",
     )
     parser.add_argument(
-        "--resolutions", nargs="+", default=None, metavar="WxH",
+        "--resolutions",
+        nargs="+",
+        default=None,
+        metavar="WxH",
         help=(
             "Target resolutions for VitisGenerateModelSD. "
-            "When provided, writes back to all config_*.json. "
-            f"Default: value in config_*.json (initially '{' '.join(DEFAULT_RESOLUTIONS)}')."
+            "When provided, writes back to config_transformer.json and config_vae_decoder.json. "
+            f"Default: value in those configs (initially '{' '.join(DEFAULT_RESOLUTIONS)}')."
         ),
     )
     parser.add_argument(
-        "--output_dir", default=str(SCRIPT_DIR / "output_model"), type=str,
+        "--output_dir",
+        default=str(SCRIPT_DIR / "output_model"),
+        type=str,
         help="Assembled pipeline output directory. Default: <script_dir>/output_model",
     )
     return parser.parse_args(raw_args)
@@ -413,16 +634,31 @@ def main(raw_args=None) -> None:
 
     if args.model_id is not None or args.resolutions is not None:
         print("\n[CONFIG] Syncing config_*.json ...")
-        update_config_files(args.model_id, args.resolutions)
+        update_config_files(args.model_id, args.resolutions, args.models)
 
     if args.model_id is None:
-        first_cfg_path = SCRIPT_DIR / f"config_{args.models[0]}.json"
-        with first_cfg_path.open() as f:
-            args.model_id = json.load(f)["input_model"]["model_path"]
+        if set(args.models) <= {"text_encoder"}:
+            args.model_id = str(DEFAULT_MODEL_ID)
+        else:
+            ref_model = next((m for m in args.models if m != "text_encoder"), args.models[0])
+            cfg_path = SCRIPT_DIR / f"config_{ref_model}.json"
+            with cfg_path.open(encoding="utf-8") as f:
+                args.model_id = json.load(f)["input_model"]["model_path"]
+
+    pipeline_root = resolve_pipeline_root(args.model_id)
+
+    if "text_encoder" in args.models:
+        print("\n[STAGE] Preparing flat text_encoder bundle ...")
+        staged_path = prepare_text_encoder_for_export(pipeline_root)
+        print(f"  text_encoder bundle: {staged_path}")
+        print(f"  pipeline model_id  : {pipeline_root}")
+        args.model_id = str(pipeline_root)
 
     if args.resolutions is None:
         args.resolutions = DEFAULT_RESOLUTIONS
         for name in args.models:
+            if name == "text_encoder":
+                continue
             with (SCRIPT_DIR / f"config_{name}.json").open() as f:
                 cfg = json.load(f)
             for pass_cfg in cfg.get("passes", {}).values():
@@ -434,10 +670,13 @@ def main(raw_args=None) -> None:
             break
 
     print("=" * 60)
-    print("  FLUX.2-klein-4B  —  Olive ONNX Export")
+    print("  FLUX.2-klein-4B  —  Ryzen AI ONNX Export")
     print("=" * 60)
     print(f"  model_id    : {args.model_id}")
     print(f"  sub-models  : {', '.join(args.models)}")
+    if "text_encoder" in args.models:
+        print("  text_encoder: ModelBuilder fp16 → MatMulNBits INT4")
+        print("  text_encoder fp16: recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json")
     print(f"  resolutions : {', '.join(args.resolutions)}")
     print(f"  output_dir  : {args.output_dir}")
     print("=" * 60)

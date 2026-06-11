@@ -1,9 +1,20 @@
 # AMD model generation
 #--extra-index-url=https://pypi.amd.com/acas/olive_SD/1.8/simple
 
+# Olive (local editable; includes ModelBuilder + hidden_states_layers for genai text_encoder)
+-e ../../../Olive[auto-opt,directml]
+
+# onnxruntime-genai (build from ../../../onnxruntime-genai with --use_dml, then install wheel)
+#   cd ../../../onnxruntime-genai
+#   python build.py --use_dml --config Release
+#   pip install build/Windows/Release/wheel/*.whl
+onnxruntime-directml>=1.24.0
+
+# GPTQ / SMP passes for genai text_encoder backend
+bitsandbytes
+
 accelerate
 datasets
-olive-ai[auto-opt]
 
 # Pin onnx version
 diffusers==0.38.0
@@ -24,4 +35,4 @@ psutil==6.0.0
 sentencepiece
 tabulate
 torch==2.7.0
-transformers==4.56.2
+transformers==4.57.6

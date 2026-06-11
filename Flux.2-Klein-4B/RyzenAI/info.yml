@@ -7,8 +7,8 @@ devices:
   - cpu
   - npu
 recipes:
-  - name: flux2-klein-4b-text-encoder
-    file: config_text_encoder.json
+  - name: flux2-klein-4b-text-encoder-fp16-modelbuilder
+    file: recipes/qwen3-4b-fp16-prompt-embeds-modelbuilder.json
   - name: flux2-klein-4b-transformer
     file: config_transformer.json
   - name: flux2-klein-4b-vae-decoder

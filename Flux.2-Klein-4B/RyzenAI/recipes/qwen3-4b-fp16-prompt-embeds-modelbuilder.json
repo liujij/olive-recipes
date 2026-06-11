@@ -1,0 +1,38 @@
+{
+  "input_model": {
+    "type": "HfModel",
+    "model_path": "Qwen/Qwen3-4B",
+    "task": "text-generation",
+    "load_kwargs": {
+      "trust_remote_code": true
+    }
+  },
+  "systems": {
+    "local_system": {
+      "type": "LocalSystem",
+      "accelerators": [
+        {
+          "execution_providers": ["CUDAExecutionProvider"],
+          "device": "gpu"
+        }
+      ]
+    }
+  },
+  "host": "local_system",
+  "target": "local_system",
+  "data_configs": [],
+  "passes": {
+    "mb": {
+      "type": "ModelBuilder",
+      "precision": "fp16",
+      "exclude_lm_head": true,
+      "use_cache": false,
+      "hidden_states_layers": [9, 18, 27],
+      "extra_options": {
+        "filename": "model.onnx"
+      }
+    }
+  },
+  "output_dir": "footprints/text_encoder_fp16_mb",
+  "log_severity_level": 1
+}

@@ -30,9 +30,20 @@ from olive.workflows import run as olive_run
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
 
-DEFAULT_MODEL_ID   = "black-forest-labs/FLUX.2-klein-4B"
-DEFAULT_RESOLUTIONS = ["1024x1024"]
-ALL_MODELS = ["transformer", "vae_decoder", "text_encoder"]
+DEFAULT_MODEL_ID        = "black-forest-labs/FLUX.2-klein-4B"
+DEFAULT_GEMMA_MODEL_ID  = "google/gemma-4-E2B"
+DEFAULT_RESOLUTIONS     = ["1024x1024"]
+DEFAULT_ADAPTER_CKPT    = SCRIPT_DIR / "weights" / "te_swap_adapter.pt"
+
+# Sub-models sourced from the FLUX.2-klein-4B pipeline.
+FLUX_MODELS = ["transformer", "vae_decoder", "text_encoder"]
+
+# All exportable sub-models; gemma_text_encoder is loaded independently
+# (Gemma-4-E2B + adapter fused into one ONNX) and does not belong to the FLUX pipeline.
+ALL_MODELS = FLUX_MODELS + ["gemma_text_encoder"]
+
+# Models that carry their own model_path (not from FLUX pipeline).
+STANDALONE_MODELS = {"gemma_text_encoder"}
 
 NON_ONNX_COMPONENTS = ["tokenizer", "tokenizer_2", "scheduler", "feature_extractor"]
 
@@ -64,8 +75,13 @@ def _fmt_seconds(seconds: float) -> str:
     return f"{s}s"
 
 
-def update_config_files(model_id: str | None, resolutions: list[str] | None) -> None:
-    for name in ALL_MODELS:
+def update_config_files(
+    model_id: str | None,
+    resolutions: list[str] | None,
+    gemma_model_id: str | None = None,
+) -> None:
+    # Update FLUX sub-model configs (model_id + resolutions).
+    for name in FLUX_MODELS:
         config_path = SCRIPT_DIR / f"config_{name}.json"
         if not config_path.exists():
             continue
@@ -87,6 +103,18 @@ def update_config_files(model_id: str | None, resolutions: list[str] | None) -> 
                 json.dump(cfg, f, indent=4)
             print(f"  [CONFIG] Updated {config_path.name}")
 
+    # Update Gemma config (only model_path, no resolutions).
+    if gemma_model_id is not None:
+        config_path = SCRIPT_DIR / "config_gemma_text_encoder.json"
+        if config_path.exists():
+            with config_path.open() as f:
+                cfg = json.load(f)
+            if cfg.get("input_model", {}).get("model_path") != gemma_model_id:
+                cfg["input_model"]["model_path"] = gemma_model_id
+                with config_path.open("w") as f:
+                    json.dump(cfg, f, indent=4)
+                print(f"  [CONFIG] Updated {config_path.name}")
+
 
 def load_olive_config(submodel_name: str) -> dict:
     config_path = SCRIPT_DIR / f"config_{submodel_name}.json"
@@ -107,6 +135,8 @@ def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Pat
     optimized_node  = None
     for node in footprints.values():
         from_pass = (node.get("from_pass") or "").lower()
+        if not from_pass:
+            continue   # skip the raw input-model node (no pass yet)
         if from_pass == "onnxconversion":
             conversion_node = node
         else:
@@ -135,6 +165,12 @@ _PIPELINE_COMPONENT_MAP = {
     "transformer": "transformer",
     "vae":         ["vae_encoder", "vae_decoder"],   # VAE covers both encoder & decoder
     "text_encoder": "text_encoder",
+}
+
+# Maps Olive submodel names to their output subdirectory names.
+# Omitted names map 1:1 (submodel_name == directory name).
+_SUBMODEL_DST_DIR = {
+    "gemma_text_encoder": "text_encoder",   # replaces Qwen INT4 in text_encoder/
 }
 
 
@@ -193,6 +229,9 @@ def _save_component_configs(pipeline, output_dir: Path) -> None:
     """Save config.json (and generation_config.json) for each ONNX sub-model."""
     import json as _json
 
+    if pipeline is None:
+        return
+
     def _write_config(component, dst_dir: Path) -> None:
         dst_dir.mkdir(parents=True, exist_ok=True)
         cfg = getattr(component, "config", None)
@@ -231,16 +270,58 @@ def _save_component_configs(pipeline, output_dir: Path) -> None:
     _save_vae_decoder_bn_stats(pipeline, output_dir)
 
 
+def _save_gemma_tokenizer(gemma_model_id: str, output_dir: Path) -> None:
+    """Save the Gemma-4-E2B tokenizer to output_dir/tokenizer_2/.
+
+    The Gemma tokenizer replaces the original Qwen tokenizer for the
+    gemma_text_encoder path. tokenizer_2 is the conventional Diffusers slot
+    for the second text encoder.
+    """
+    try:
+        from transformers import AutoTokenizer
+    except ImportError:
+        print("  [WARN] transformers not available; skipping tokenizer_2 save.")
+        return
+
+    dest = output_dir / "tokenizer_2"
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        tok = AutoTokenizer.from_pretrained(gemma_model_id)
+        tok.save_pretrained(str(dest))
+        print(f"  [SAVE]  tokenizer_2 (Gemma) → {dest}")
+    except Exception as exc:
+        print(f"  [WARN] Could not save Gemma tokenizer: {exc}")
+
+
+def _save_gemma_text_encoder_config(gemma_model_id: str, text_encoder_dir: Path) -> None:
+    """Save the Gemma text-tower config.json into the text_encoder output directory."""
+    try:
+        from transformers import AutoConfig
+    except ImportError:
+        return
+
+    text_encoder_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = AutoConfig.from_pretrained(gemma_model_id)
+        cfg.save_pretrained(str(text_encoder_dir))
+        print(f"  [CONFIG]  text_encoder/config.json (Gemma)")
+    except Exception as exc:
+        print(f"  [WARN] Could not save Gemma config: {exc}")
+
+
 def assemble_output_dir(
     pipeline,
     submodel_names: list[str],
     footprints_dir: Path,
     output_dir: Path,
+    gemma_model_id: str | None = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for name in submodel_names:
-        dst_dir = output_dir / name
+        # Resolve destination directory (gemma models remap to standard names).
+        dst_name = _SUBMODEL_DST_DIR.get(name, name)
+        dst_dir  = output_dir / dst_name
 
         try:
             _, optimized_path = _read_footprint(footprints_dir, name)
@@ -267,7 +348,7 @@ def assemble_output_dir(
                 break
         else:
             dd_src = None
-        
+
         if dd_src is not None:
             dst_path = dst_dir / ("dd" if dd_src.name == "dd" else "dynamic" / "dd")
             shutil.rmtree(dst_dir, ignore_errors=True)
@@ -288,24 +369,31 @@ def assemble_output_dir(
                     shutil.copy2(companion, dst_dir / companion.name)
             print(f"  [COPY CPU]  {name} → {dst_dir / 'model.onnx'}")
 
+    # After ONNX copying: save Gemma-specific artefacts when the gemma path is active.
+    if "gemma_text_encoder" in submodel_names:
+        resolved_gemma_id = gemma_model_id or DEFAULT_GEMMA_MODEL_ID
+        _save_gemma_text_encoder_config(resolved_gemma_id, output_dir / "text_encoder")
+        _save_gemma_tokenizer(resolved_gemma_id, output_dir)
+
     _save_component_configs(pipeline, output_dir)
 
-    for attr in NON_ONNX_COMPONENTS:
-        component = getattr(pipeline, attr, None)
-        if component is None:
-            continue
-        save_fn = getattr(component, "save_pretrained", None)
-        if save_fn is None:
-            continue
-        dest = output_dir / attr
-        dest.mkdir(parents=True, exist_ok=True)
-        save_fn(str(dest))
-        print(f"  [SAVE]  {attr} → {dest}")
+    if pipeline is not None:
+        for attr in NON_ONNX_COMPONENTS:
+            component = getattr(pipeline, attr, None)
+            if component is None:
+                continue
+            save_fn = getattr(component, "save_pretrained", None)
+            if save_fn is None:
+                continue
+            dest = output_dir / attr
+            dest.mkdir(parents=True, exist_ok=True)
+            save_fn(str(dest))
+            print(f"  [SAVE]  {attr} → {dest}")
 
-    # Write the top-level model_index.json so the directory is recognised
-    # as a Diffusers pipeline by downstream loaders.
-    pipeline.save_config(str(output_dir))
-    print("  [SAVE]  model_index.json")
+        # Write the top-level model_index.json so the directory is recognised
+        # as a Diffusers pipeline by downstream loaders.
+        pipeline.save_config(str(output_dir))
+        print("  [SAVE]  model_index.json")
 
     print(f"\n  Pipeline assembled at: {output_dir}")
 
@@ -314,17 +402,34 @@ def optimize(args) -> dict[str, bool]:
     model_id   = args.model_id
     output_dir = Path(args.output_dir).resolve()
 
-    print(f"\n[PIPELINE] Loading Flux2KleinPipeline from '{model_id}' ...")
-    from diffusers import Flux2KleinPipeline
-    pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+    # Propagate the adapter checkpoint path to user_script.py loaders via
+    # environment variables (Olive passes only model_path to loader functions).
+    # The adapter code lives in adapter.py; weights default to weights/te_swap_adapter.pt.
+    #
+    #   OLIVE_ADAPTER_CKPT  → gemma_with_adapter_load: loads adapter EMA weights
+    #   OLIVE_LORA_CKPT     → transformer_load:         merges LoRA into DiT
+    resolved_ckpt = str(DEFAULT_ADAPTER_CKPT)
+    os.environ["OLIVE_ADAPTER_CKPT"] = resolved_ckpt
+    os.environ["OLIVE_LORA_CKPT"]    = resolved_ckpt
+    print(f"\n[ADAPTER] OLIVE_ADAPTER_CKPT={resolved_ckpt}")
+    print(f"[LORA]    OLIVE_LORA_CKPT={resolved_ckpt}")
 
-    t_cfg   = pipeline.transformer.config
-    vae_cfg = pipeline.vae.config
-    print(f"  Transformer : in_channels={t_cfg.in_channels}, "
-          f"joint_attention_dim={t_cfg.joint_attention_dim}, "
-          f"num_layers={t_cfg.num_layers}")
-    print(f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
-          f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}")
+    # Determine which sub-models require the FLUX pipeline to be loaded.
+    flux_submodels = [m for m in args.models if m in FLUX_MODELS]
+
+    pipeline = None
+    if flux_submodels:
+        print(f"\n[PIPELINE] Loading Flux2KleinPipeline from '{model_id}' ...")
+        from diffusers import Flux2KleinPipeline
+        pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+
+        t_cfg   = pipeline.transformer.config
+        vae_cfg = pipeline.vae.config
+        print(f"  Transformer : in_channels={t_cfg.in_channels}, "
+              f"joint_attention_dim={t_cfg.joint_attention_dim}, "
+              f"num_layers={t_cfg.num_layers}")
+        print(f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
+              f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}")
 
     results: dict[str, bool] = {}
     total_t0 = time.monotonic()
@@ -346,9 +451,16 @@ def optimize(args) -> dict[str, bool]:
     total_elapsed = time.monotonic() - total_t0
 
     print(f"\n{'=' * 60}\n  Assembling output directory ...\n{'=' * 60}")
-    assemble_output_dir(pipeline, args.models, SCRIPT_DIR / "footprints", output_dir)
+    assemble_output_dir(
+        pipeline,
+        args.models,
+        SCRIPT_DIR / "footprints",
+        output_dir,
+        gemma_model_id=getattr(args, "gemma_model_id", None),
+    )
 
-    del pipeline
+    if pipeline is not None:
+        del pipeline
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -378,9 +490,17 @@ def parse_args(raw_args=None) -> argparse.Namespace:
     parser.add_argument(
         "--model_id", default=None, type=str,
         help=(
-            "HuggingFace model ID or local path. "
-            "When provided, writes back to all config_*.json. "
+            "HuggingFace model ID or local path for FLUX.2-klein-4B. "
+            "When provided, writes back to FLUX config_*.json. "
             f"Default: value in config_*.json (initially '{DEFAULT_MODEL_ID}')."
+        ),
+    )
+    parser.add_argument(
+        "--gemma_model_id", default=None, type=str,
+        help=(
+            "HuggingFace model ID or local path for google/gemma-4-E2B. "
+            "When provided, writes back to config_gemma_text_encoder.json. "
+            f"Default: value in config_gemma_text_encoder.json (initially '{DEFAULT_GEMMA_MODEL_ID}')."
         ),
     )
     parser.add_argument(
@@ -399,7 +519,29 @@ def parse_args(raw_args=None) -> argparse.Namespace:
         "--output_dir", default=str(SCRIPT_DIR / "output_model"), type=str,
         help="Assembled pipeline output directory. Default: <script_dir>/output_model",
     )
+    parser.add_argument(
+        "--clear_cache", action="store_true",
+        help=(
+            "Clear the Olive cache and footprints for the requested sub-models "
+            "before exporting. Use this to force a full re-export (e.g. after "
+            "changing GemmaWithAdapterWrapper or adapter.py)."
+        ),
+    )
     return parser.parse_args(raw_args)
+
+
+def clear_olive_cache(models: list[str]) -> None:
+    """Delete Olive workflow cache and footprints for the given sub-models."""
+    cache_dir = SCRIPT_DIR / "ryzenai_cache" / "default_workflow"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+        print(f"  [CACHE] Removed {cache_dir}")
+    footprint_root = SCRIPT_DIR / "footprints"
+    for name in models:
+        fp_dir = footprint_root / name
+        if fp_dir.exists():
+            shutil.rmtree(fp_dir)
+            print(f"  [CACHE] Removed footprint {fp_dir}")
 
 
 def main(raw_args=None) -> None:
@@ -411,18 +553,29 @@ def main(raw_args=None) -> None:
     else:
         args.models = list(ALL_MODELS)
 
+    if getattr(args, "clear_cache", False):
+        print("\n[CACHE] Clearing Olive cache for:", ", ".join(args.models))
+        clear_olive_cache(args.models)
+
     if args.model_id is not None or args.resolutions is not None:
         print("\n[CONFIG] Syncing config_*.json ...")
         update_config_files(args.model_id, args.resolutions)
 
+    # Resolve args.model_id from first FLUX config (skip standalone models).
     if args.model_id is None:
-        first_cfg_path = SCRIPT_DIR / f"config_{args.models[0]}.json"
-        with first_cfg_path.open() as f:
-            args.model_id = json.load(f)["input_model"]["model_path"]
+        flux_in_list = [m for m in args.models if m not in STANDALONE_MODELS]
+        if flux_in_list:
+            first_cfg_path = SCRIPT_DIR / f"config_{flux_in_list[0]}.json"
+            with first_cfg_path.open() as f:
+                args.model_id = json.load(f)["input_model"]["model_path"]
+        else:
+            args.model_id = DEFAULT_MODEL_ID
 
     if args.resolutions is None:
         args.resolutions = DEFAULT_RESOLUTIONS
         for name in args.models:
+            if name in STANDALONE_MODELS:
+                continue
             with (SCRIPT_DIR / f"config_{name}.json").open() as f:
                 cfg = json.load(f)
             for pass_cfg in cfg.get("passes", {}).values():
@@ -440,6 +593,7 @@ def main(raw_args=None) -> None:
     print(f"  sub-models  : {', '.join(args.models)}")
     print(f"  resolutions : {', '.join(args.resolutions)}")
     print(f"  output_dir  : {args.output_dir}")
+    print(f"  adapter     : {DEFAULT_ADAPTER_CKPT}")
     print("=" * 60)
 
     results = optimize(args)

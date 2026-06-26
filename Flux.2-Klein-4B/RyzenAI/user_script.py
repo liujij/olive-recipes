@@ -95,7 +95,63 @@ class FluxTransformerWrapper(nn.Module):
 # Model loader
 # ---------------------------------------------------------------------------
 
-def transformer_load(model_path: str) -> FluxTransformerWrapper:
+def _merge_lora_into_transformer(transformer: nn.Module, lora_ckpt_path: str) -> None:
+    """Load LoRA weights from te_swap_adapter.pt and merge them (W += B @ A * scale)
+    into the matching Linear modules of the transformer in-place.
+
+    Matching targets: .attn.(to_k|to_v|add_k_proj|add_v_proj)
+    The checkpoint stores lora tensors as [A0, B0, A1, B1, ...] in module-discovery
+    order, which is the exact order produced by inject_lora() in lora.py.
+    """
+    import re
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    sd = torch.load(lora_ckpt_path, map_location="cpu")
+    lora_tensors = sd.get("lora")
+    if not lora_tensors:
+        print(f"  [LORA] No 'lora' key in checkpoint {lora_ckpt_path}; skipping LoRA merge.")
+        return
+
+    cfg = sd.get("config", {"lora_rank": 64})
+    rank  = cfg.get("lora_rank", 64)
+    scale = 1.0  # alpha == rank, so scale = alpha/rank = 1.0
+
+    pattern = re.compile(r"\.attn\.(to_k|to_v|add_k_proj|add_v_proj)$")
+    matched_linears: list[nn.Linear] = []
+    for name, mod in transformer.named_modules():
+        for child_name, child in mod.named_children():
+            full = f"{name}.{child_name}" if name else child_name
+            if isinstance(child, nn.Linear) and pattern.search(full):
+                matched_linears.append(child)
+
+    expected_pairs = len(matched_linears)
+    if len(lora_tensors) != expected_pairs * 2:
+        print(
+            f"  [LORA] LoRA tensor count mismatch: "
+            f"checkpoint has {len(lora_tensors)}, "
+            f"model has {expected_pairs} target linears × 2. Skipping LoRA merge."
+        )
+        return
+
+    merged = 0
+    for i, linear in enumerate(matched_linears):
+        A = lora_tensors[i * 2].to(dtype=linear.weight.dtype, device=linear.weight.device)   # [rank, in]
+        B = lora_tensors[i * 2 + 1].to(dtype=linear.weight.dtype, device=linear.weight.device)  # [out, rank]
+        linear.weight.data.add_(B @ A, alpha=scale)
+        merged += 1
+
+    print(f"  [LORA] Merged LoRA into {merged} Linear modules (rank={rank}, scale={scale:.3f}).")
+
+
+def transformer_load(model_path: str, lora_ckpt: str | None = None) -> FluxTransformerWrapper:
+    """Load Flux2Transformer2DModel and optionally merge LoRA weights.
+
+    lora_ckpt can be passed directly or via the OLIVE_LORA_CKPT environment
+    variable (set by export_models.py when --lora_ckpt is provided), because
+    Olive's model_loader mechanism only passes model_path.
+    """
+    import os as _os
     from diffusers import Flux2Transformer2DModel
 
     # Register the RMSNorm custom symbolic here so it only affects the
@@ -110,6 +166,16 @@ def transformer_load(model_path: str) -> FluxTransformerWrapper:
     )
     transformer.eval()
     transformer.to(device=device)
+
+    from pathlib import Path as _Path
+    _default_lora = _Path(__file__).parent / "weights" / "te_swap_adapter.pt"
+    resolved_ckpt = lora_ckpt or _os.environ.get("OLIVE_LORA_CKPT") or (
+        str(_default_lora) if _default_lora.exists() else None
+    )
+    if resolved_ckpt:
+        print(f"  [LORA] Merging LoRA weights from {resolved_ckpt} into transformer ...")
+        _merge_lora_into_transformer(transformer, resolved_ckpt)
+
     return FluxTransformerWrapper(transformer)
 
 
@@ -402,4 +468,288 @@ def vae_decoder_conversion_inputs(model=None):
             dtype=torch.float32,
             device=device,
         )
+    }
+
+
+# =============================================================================
+# Gemma-4-E2B Text Encoder (TE-swap adapter source encoder)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Wrapper
+#
+# Gemma-4-E2B is a multimodal model; only the text tower (language_model,
+# 35 layers, hidden 1536) is used.  We extract four hidden states at layers
+# {9, 18, 26, 30} — the candidate-layer superset consumed by
+# GemmaToKleinAdapterV2 — and return them as individual fp32 tensors so the
+# adapter can apply its per-tap var-norm + learnable softmax mixing.
+#
+# The attention_mask is passed as a plain [B, seq] int64 tensor.  Gemma4's
+# text tower accepts this natively when attn_implementation="eager", which
+# also avoids the scaled_dot_product_attention / .item() trace failures that
+# affect the causal-mask path.
+# ---------------------------------------------------------------------------
+
+_GEMMA_LAYER_PICKS = (9, 18, 26, 30)
+
+
+class GemmaTextEncoderWrapper(nn.Module):
+    """Gemma-4-E2B text tower wrapper for ONNX export.
+
+    Returns four hidden-state taps (layers 9, 18, 26, 30), each
+    [B, seq, 1536], as separate fp32 tensors named tap_9/18/26/30.
+    output_hidden_states is hardcoded True so torch.jit.trace never
+    sees it as a dynamic branch.
+    """
+
+    def __init__(self, text_model: nn.Module, layer_picks: tuple = _GEMMA_LAYER_PICKS) -> None:
+        super().__init__()
+        self.text_model = text_model
+        self.layer_picks = layer_picks
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple:
+        outputs = self.text_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hs = outputs.hidden_states  # tuple len = n_layers + 1
+        return tuple(hs[i] for i in self.layer_picks)  # 4 x [B, seq, 1536]
+
+
+# ---------------------------------------------------------------------------
+# Model loader
+# ---------------------------------------------------------------------------
+
+def gemma_text_encoder_load(model_path: str) -> GemmaTextEncoderWrapper:
+    """Load Gemma-4-E2B, extract the text tower, discard vision components."""
+    import gc
+    try:
+        from transformers import Gemma4ForConditionalGeneration
+    except ImportError:
+        import transformers
+        raise ImportError(
+            f"Gemma4ForConditionalGeneration is not available in the installed "
+            f"transformers {transformers.__version__}. "
+            "Upgrade to transformers >= 5.0: "
+            "pip install 'transformers>=5.0.0'"
+        ) from None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    full = Gemma4ForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32,
+        attn_implementation="eager",
+        low_cpu_mem_usage=True,
+    )
+
+    # Extract the pure text backbone (Gemma4TextModel).
+    lang = getattr(full, "language_model", None)
+    if lang is None:
+        lang = getattr(getattr(full, "model", full), "language_model", None)
+    if lang is None or not hasattr(lang, "layers"):
+        raise RuntimeError(
+            "Could not locate Gemma4TextModel (.language_model) in the loaded model"
+        )
+
+    # Detach and free the multimodal components we don't need.
+    for attr in ("vision_tower", "audio_tower", "multi_modal_projector", "lm_head"):
+        if hasattr(full, attr):
+            setattr(full, attr, None)
+    del full
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for p in lang.parameters():
+        p.requires_grad_(False)
+
+    lang.to(device=device).eval()
+    return GemmaTextEncoderWrapper(lang).eval()
+
+
+# ---------------------------------------------------------------------------
+# Dummy inputs
+#
+# seq_len=512 matches GemmaTextEncoder.max_sequence_length in
+# te_swap_adapter/src/gemma_text_encoder.py.
+# ---------------------------------------------------------------------------
+
+_GEMMA_BATCH   = 1
+_GEMMA_SEQ_LEN = 512
+
+
+def gemma_text_encoder_conversion_inputs(model=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return {
+        "input_ids":      torch.zeros((_GEMMA_BATCH, _GEMMA_SEQ_LEN), dtype=torch.long, device=device),
+        "attention_mask": torch.ones((_GEMMA_BATCH, _GEMMA_SEQ_LEN),  dtype=torch.long, device=device),
+    }
+
+
+# =============================================================================
+# Gemma-4-E2B + GemmaToKleinAdapterV2 — Combined ONNX wrapper
+# =============================================================================
+
+from adapter import GemmaToKleinAdapterV2  # local adapter.py (no external dependency)
+
+# ---------------------------------------------------------------------------
+# Combined wrapper
+#
+# Exposes the same interface as the original Qwen text_encoder:
+#   forward(input_ids, attention_mask) -> prompt_embeds [B, seq, 7680]
+#
+# Internally it runs the Gemma text tower to extract the 4 hidden-state taps
+# (layers 9/18/26/30) and passes them through GemmaToKleinAdapterV2.
+# The attention_mask (int64 right-pad) is passed to both the Gemma model and
+# the adapter's BidirectionalRefiner.  position_ids are NOT required.
+# ---------------------------------------------------------------------------
+
+_ADAPTER_GEMMA_HIDDEN = 1536
+_ADAPTER_KLEIN_DIM    = 7680
+_ADAPTER_CANDIDATES   = (9, 18, 26, 30)
+
+
+class GemmaWithAdapterWrapper(nn.Module):
+    """Gemma-4-E2B text tower + GemmaToKleinAdapterV2, fused into one nn.Module.
+
+    Input:  input_ids [B, seq], attention_mask [B, seq]
+    Output: prompt_embeds [B, seq, 7680]
+
+    This is a drop-in replacement for the Qwen3 text_encoder ONNX
+    (no position_ids, seq=512 instead of 256).
+    """
+
+    def __init__(self, gemma_text_model: nn.Module, adapter: nn.Module) -> None:
+        super().__init__()
+        self.gemma = gemma_text_model   # Gemma4TextModel (text tower only)
+        self.adapter = adapter          # GemmaToKleinAdapterV2
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,        # [B, seq]  int64
+        attention_mask: torch.Tensor,   # [B, seq]  int64
+    ) -> torch.Tensor:                  # [B, seq, 7680]
+        out = self.gemma(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hs = out.hidden_states          # tuple, index 0 = embedding, 1..N = layers
+        taps = [hs[i] for i in _ADAPTER_CANDIDATES]
+        return self.adapter(taps, attention_mask=attention_mask.bool())
+
+
+# ---------------------------------------------------------------------------
+# Model loader
+#
+# model_path  →  Gemma-4-E2B HF repo ID or local path
+# OLIVE_ADAPTER_CKPT env var  →  path to te_swap_adapter.pt
+#   (set by export_models.py via --adapter_ckpt, or hard-set in the
+#    environment before running olive run manually)
+# ---------------------------------------------------------------------------
+
+def gemma_with_adapter_load(model_path: str) -> GemmaWithAdapterWrapper:
+    """Load Gemma-4-E2B text tower + GemmaToKleinAdapterV2 as a single module.
+
+    Both sub-models are kept in fp32 for stable ONNX tracing; the downstream
+    OrtTransformersOptimization fp16 pass converts weights after export.
+    """
+    import gc as _gc
+    import os as _os
+    from pathlib import Path as _Path
+
+    # Register aten::rms_norm → custom decomposed symbolic so torch.onnx.export
+    # at opset 17 can handle both Gemma's RMSNorm and the adapter's nn.RMSNorm.
+    torch.onnx.register_custom_op_symbolic("aten::rms_norm", _rms_norm_symbolic, 17)
+
+    # ---- resolve adapter checkpoint (env var → default bundled path) ----
+    _default_ckpt = _Path(__file__).parent / "weights" / "te_swap_adapter.pt"
+    adapter_ckpt  = _Path(_os.environ.get("OLIVE_ADAPTER_CKPT", str(_default_ckpt)))
+    if not adapter_ckpt.exists():
+        raise RuntimeError(
+            f"Adapter checkpoint not found: {adapter_ckpt}\n"
+            "Place te_swap_adapter.pt in the weights/ directory, or set "
+            "OLIVE_ADAPTER_CKPT to the correct path."
+        )
+
+    # ---- load Gemma text tower ----
+    try:
+        from transformers import Gemma4ForConditionalGeneration
+    except ImportError:
+        import transformers
+        raise ImportError(
+            f"Gemma4ForConditionalGeneration is not available in the installed "
+            f"transformers {transformers.__version__}. "
+            "Upgrade: pip install 'transformers>=5.0.0'"
+        ) from None
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    full = Gemma4ForConditionalGeneration.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32,
+        attn_implementation="eager",
+        low_cpu_mem_usage=True,
+    )
+    lang = getattr(full, "language_model", None)
+    if lang is None:
+        lang = getattr(getattr(full, "model", full), "language_model", None)
+    if lang is None or not hasattr(lang, "layers"):
+        raise RuntimeError("Could not locate Gemma4TextModel (.language_model)")
+
+    for attr in ("vision_tower", "audio_tower", "multi_modal_projector", "lm_head"):
+        if hasattr(full, attr):
+            setattr(full, attr, None)
+    del full
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    for p in lang.parameters():
+        p.requires_grad_(False)
+    lang.to(device=device).eval()
+
+    # ---- load adapter ----
+    sd = torch.load(str(adapter_ckpt), map_location="cpu")
+    cfg = sd.get("config", {"refiner_depth": 2})
+    adapter = GemmaToKleinAdapterV2(
+        candidates=_ADAPTER_CANDIDATES,
+        refiner_depth=cfg.get("refiner_depth", 2),
+    )
+    ema_state = sd.get("ema", sd.get("adapter", sd))
+    adapter.load_state_dict(ema_state, strict=False)
+    for p in adapter.parameters():
+        p.requires_grad_(False)
+    adapter.to(device=device, dtype=torch.float32).eval()
+
+    return GemmaWithAdapterWrapper(lang, adapter).eval()
+
+
+# ---------------------------------------------------------------------------
+# Dummy inputs
+# ---------------------------------------------------------------------------
+
+_GEMMA_ADAPTER_BATCH   = 1
+_GEMMA_ADAPTER_SEQ_LEN = 512
+
+
+def gemma_with_adapter_conversion_inputs(model=None):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return {
+        "input_ids":      torch.zeros(
+            (_GEMMA_ADAPTER_BATCH, _GEMMA_ADAPTER_SEQ_LEN), dtype=torch.long, device=device
+        ),
+        "attention_mask": torch.ones(
+            (_GEMMA_ADAPTER_BATCH, _GEMMA_ADAPTER_SEQ_LEN), dtype=torch.long, device=device
+        ),
     }

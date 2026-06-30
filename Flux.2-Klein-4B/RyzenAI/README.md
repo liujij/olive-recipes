@@ -8,13 +8,15 @@ assemble a self-contained output directory (ONNX models + tokenizer + scheduler)
 
 ## Prerequisites
 
-| Requirement | Notes |
-|---|---|
-| AMD NPU hardware | Ryzen AI device (NPU required for transformer / VAE decoder) |
-| Windows 10/11 (x64) | Tested environment |
-| Conda | [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda |
-| ~40 GB free disk | Weights + ONNX artifacts + Olive cache |
+
+| Requirement         | Notes                                                                                                                      |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| AMD NPU hardware    | Ryzen AI device (NPU required for transformer / VAE decoder)                                                               |
+| Windows 10/11 (x64) | Tested environment                                                                                                         |
+| Conda               | [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or Anaconda                                                    |
+| ~40 GB free disk    | Weights + ONNX artifacts + Olive cache                                                                                     |
 | HuggingFace account | [FLUX.2-klein-4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) is a gated model — license acceptance required |
+
 
 ## Step 1 — Create the conda environment
 
@@ -43,16 +45,18 @@ The script will:
 2. Export each sub-model to ONNX via Olive.
 3. Compile the transformer and VAE decoder for AMD NPU using `VitisGenerateModelSD`.
 4. Assemble the final pipeline directory, including non-ONNX components
-   (tokenizer, scheduler).
+  (tokenizer, scheduler).
 
 ### Optional arguments
 
-| Argument | Default | Description |
-|---|---|---|
-| `--model_id` | value stored in `config_*.json` | HuggingFace model ID or local path. Written back to all config files. |
-| `--models` | all | Sub-models to export. Choices: `transformer vae_decoder text_encoder` |
-| `--resolutions` | `1024x1024` | NPU compilation resolution(s). Written back to all config files. |
-| `--output_dir` | `./output_model` | Destination for the assembled pipeline directory. |
+
+| Argument        | Default                         | Description                                                           |
+| --------------- | ------------------------------- | --------------------------------------------------------------------- |
+| `--model_id`    | value stored in `config_*.json` | HuggingFace model ID or local path. Written back to all config files. |
+| `--models`      | all                             | Sub-models to export. Choices: `transformer vae_decoder text_encoder` |
+| `--resolutions` | `1024x1024`                     | NPU compilation resolution(s). Written back to all config files.      |
+| `--output_dir`  | `./output_model`                | Destination for the assembled pipeline directory.                     |
+
 
 ```bash
 # Export only the transformer
@@ -80,7 +84,8 @@ output_model/
 │   │   └── replaced.onnx      ← NPU-compiled
 │   └── cache/
 ├── text_encoder/
-│   └── model.onnx             ← CPU ONNX
+│   ├── model.onnx             ← fp16 ONNX (ModelBuilder, onnxruntime-genai)
+│   ├── model.onnx.data
 ├── tokenizer/
 └── scheduler/
 ```
@@ -88,3 +93,4 @@ output_model/
 > Olive writes intermediate outputs under `footprints/` and caches converted
 > models in `cache/`. These can be safely deleted after the final pipeline is
 > assembled.
+

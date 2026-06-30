@@ -14,7 +14,7 @@
 #   output_model/
 #     transformer/dd/replaced.onnx   NPU (RyzenAI)
 #     vae_decoder/dd/replaced.onnx   NPU (RyzenAI)
-#     text_encoder/model.onnx        CPU ONNX
+#     text_encoder/model.onnx    fp16 ONNX (ModelBuilder -> onnx_utils preprocess)
 #     tokenizer/                     from pipeline
 #     scheduler/                     from pipeline
 
@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -33,6 +34,16 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_MODEL_ID   = "black-forest-labs/FLUX.2-klein-4B"
 DEFAULT_RESOLUTIONS = ["1024x1024"]
 ALL_MODELS = ["transformer", "vae_decoder", "text_encoder"]
+
+# onnx_utils preprocess recipe used to optimize the text-encoder ONNX.
+TEXT_ENCODER_OPTIMIZE_RECIPE = "qwen3_4b_no_cache"
+
+# HF metadata copied from <model_id>/text_encoder next to the optimized ONNX.
+TEXT_ENCODER_COMPANION_FILES = [
+    "config.json",
+    "generation_config.json",
+    "model.safetensors.index.json",
+]
 
 NON_ONNX_COMPONENTS = ["tokenizer", "tokenizer_2", "scheduler", "feature_extractor"]
 
@@ -98,6 +109,57 @@ def load_olive_config(submodel_name: str) -> dict:
     with config_path.open() as f:
         return json.load(f)
 
+
+def _run_cmd(cmd: list[str]) -> int:
+    """Run a subprocess command from SCRIPT_DIR, streaming its output."""
+    print(f"  [RUN] {' '.join(cmd)}")
+    return subprocess.run(cmd, cwd=str(SCRIPT_DIR)).returncode
+
+
+def export_text_encoder(model_id: str, output_dir: Path) -> bool:
+    """Export + optimize the text encoder via the RyzenAI CLI tools.
+
+    1. ``olive run --config config_text_encoder.json`` produces the ONNX at
+       ``footprints/text_encoder/model.onnx``.
+    2. ``onnx_utils preprocess --optimize qwen3_4b_no_cache model.onnx
+       model.onnx --save-as-external --keep-dynamic`` writes the optimized
+       graph to ``<output_dir>/text_encoder/model.onnx``.
+    3. The HF config / weight-index files are copied from
+       ``<model_id>/text_encoder`` next to the optimized ONNX.
+    """
+    config_path = SCRIPT_DIR / "config_text_encoder.json"
+    model_onnx  = SCRIPT_DIR / "footprints" / "text_encoder" / "model.onnx"
+    dst_dir     = output_dir / "text_encoder"
+
+    if _run_cmd(["olive", "run", "--config", str(config_path)]) != 0:
+        print("  [ERROR] olive run failed for text_encoder.")
+        return False
+    if not model_onnx.exists():
+        print(f"  [ERROR] Expected ONNX not found at {model_onnx}")
+        return False
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    optimized_onnx = dst_dir / "model.onnx"
+    if _run_cmd([
+        "onnx_utils", "preprocess",
+        "--optimize", TEXT_ENCODER_OPTIMIZE_RECIPE,
+        str(model_onnx), str(optimized_onnx),
+        "--save-as-external", "--keep-dynamic",
+    ]) != 0:
+        print("  [ERROR] onnx_utils preprocess failed for text_encoder.")
+        return False
+
+    src_dir = Path(model_id) / "text_encoder"
+    for name in TEXT_ENCODER_COMPANION_FILES:
+        src = src_dir / name
+        if src.exists():
+            shutil.copy2(src, dst_dir / name)
+            print(f"  [COPY]  {name} -> {dst_dir / name}")
+        else:
+            print(f"  [WARN]  {src} not found; skipping.")
+
+    print(f"  [OK] text_encoder -> {optimized_onnx}")
+    return True
 
 
 def _read_footprint(footprints_dir: Path, submodel_name: str) -> tuple[Path, Path]:
@@ -323,41 +385,54 @@ def optimize(args) -> dict[str, bool]:
     model_id   = args.model_id
     output_dir = Path(args.output_dir).resolve()
 
-    print(f"\n[PIPELINE] Loading Flux2KleinPipeline from '{model_id}' ...")
-    from diffusers import Flux2KleinPipeline
-    pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+    # text_encoder is exported through a standalone CLI flow (olive run +
+    # onnx_utils) and does not need the diffusers pipeline. Only load the
+    # pipeline when transformer / VAE sub-models are requested.
+    pipeline_models = [m for m in args.models if m != "text_encoder"]
 
-    t_cfg   = pipeline.transformer.config
-    vae_cfg = pipeline.vae.config
-    print(f"  Transformer : in_channels={t_cfg.in_channels}, "
-          f"joint_attention_dim={t_cfg.joint_attention_dim}, "
-          f"num_layers={t_cfg.num_layers}")
-    print(f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
-          f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}")
+    pipeline = None
+    if pipeline_models:
+        print(f"\n[PIPELINE] Loading Flux2KleinPipeline from '{model_id}' ...")
+        from diffusers import Flux2KleinPipeline
+        pipeline = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=torch.float32)
+
+        t_cfg   = pipeline.transformer.config
+        vae_cfg = pipeline.vae.config
+        print(f"  Transformer : in_channels={t_cfg.in_channels}, "
+              f"joint_attention_dim={t_cfg.joint_attention_dim}, "
+              f"num_layers={t_cfg.num_layers}")
+        print(f"  VAE         : latent_channels={vae_cfg.latent_channels}, "
+              f"scaling_factor={getattr(vae_cfg, 'scaling_factor', 'N/A')}")
 
     results: dict[str, bool] = {}
     total_t0 = time.monotonic()
 
     for submodel_name in args.models:
         print(f"\n{'=' * 60}\n  Exporting: {submodel_name}\n{'=' * 60}")
-        olive_config = load_olive_config(submodel_name)
         t0 = time.monotonic()
-        try:
-            olive_run(olive_config)
-            success = True
-        except Exception as exc:
-            print(f"\n[ERROR] {submodel_name} export failed: {exc}")
-            success = False
+        if submodel_name == "text_encoder":
+            success = export_text_encoder(model_id, output_dir)
+        else:
+            olive_config = load_olive_config(submodel_name)
+            try:
+                olive_run(olive_config)
+                success = True
+            except Exception as exc:
+                print(f"\n[ERROR] {submodel_name} export failed: {exc}")
+                success = False
         elapsed = time.monotonic() - t0
         results[submodel_name] = success
         print(f"\n  [{'OK' if success else 'FAILED'}]  {submodel_name}  ({_fmt_seconds(elapsed)})")
 
     total_elapsed = time.monotonic() - total_t0
 
-    print(f"\n{'=' * 60}\n  Assembling output directory ...\n{'=' * 60}")
-    assemble_output_dir(pipeline, args.models, SCRIPT_DIR / "footprints", output_dir)
+    # text_encoder already writes its model.onnx straight into output_dir,
+    # so only the pipeline sub-models go through assemble_output_dir.
+    if pipeline is not None:
+        print(f"\n{'=' * 60}\n  Assembling output directory ...\n{'=' * 60}")
+        assemble_output_dir(pipeline, pipeline_models, SCRIPT_DIR / "footprints", output_dir)
 
-    del pipeline
+        del pipeline
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 

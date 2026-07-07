@@ -172,6 +172,10 @@ def transformer_load(model_path: str, lora_ckpt: str | None = None) -> FluxTrans
     resolved_ckpt = lora_ckpt or _os.environ.get("OLIVE_LORA_CKPT") or (
         str(_default_lora) if _default_lora.exists() else None
     )
+    # Opt-out: export the stock transformer WITHOUT the trained LoRA merged.
+    if _os.environ.get("OLIVE_DISABLE_LORA") == "1":
+        print("  [LORA] OLIVE_DISABLE_LORA=1 -> skipping LoRA merge (stock transformer).")
+        resolved_ckpt = None
     if resolved_ckpt:
         print(f"  [LORA] Merging LoRA weights from {resolved_ckpt} into transformer ...")
         _merge_lora_into_transformer(transformer, resolved_ckpt)

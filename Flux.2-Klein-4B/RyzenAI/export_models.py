@@ -288,7 +288,7 @@ def _save_gemma_tokenizer(gemma_model_id: str, output_dir: Path) -> None:
     try:
         tok = AutoTokenizer.from_pretrained(gemma_model_id)
         tok.save_pretrained(str(dest))
-        print(f"  [SAVE]  tokenizer_2 (Gemma) → {dest}")
+        print(f"  [SAVE]  tokenizer_2 (Gemma) -> {dest}")
     except Exception as exc:
         print(f"  [WARN] Could not save Gemma tokenizer: {exc}")
 
@@ -353,7 +353,7 @@ def assemble_output_dir(
             dst_path = dst_dir / ("dd" if dd_src.name == "dd" else "dynamic" / "dd")
             shutil.rmtree(dst_dir, ignore_errors=True)
             shutil.copytree(dd_src, dst_path)
-            print(f"  [COPY NPU] {name} → {dst_path}")
+            print(f"  [COPY NPU] {name} -> {dst_path}")
         else:
             # CPU / plain ONNX: copy model.onnx and external data file only.
             onnx_file = optimized_path if optimized_path.is_file() else optimized_path / "model.onnx"
@@ -367,7 +367,7 @@ def assemble_output_dir(
                     continue
                 if companion.suffix == ".data" or companion.name.startswith(onnx_file.stem + "."):
                     shutil.copy2(companion, dst_dir / companion.name)
-            print(f"  [COPY CPU]  {name} → {dst_dir / 'model.onnx'}")
+            print(f"  [COPY CPU]  {name} -> {dst_dir / 'model.onnx'}")
 
     # After ONNX copying: save Gemma-specific artefacts when the gemma path is active.
     if "gemma_text_encoder" in submodel_names:
@@ -388,7 +388,7 @@ def assemble_output_dir(
             dest = output_dir / attr
             dest.mkdir(parents=True, exist_ok=True)
             save_fn(str(dest))
-            print(f"  [SAVE]  {attr} → {dest}")
+            print(f"  [SAVE]  {attr} -> {dest}")
 
         # Write the top-level model_index.json so the directory is recognised
         # as a Diffusers pipeline by downstream loaders.

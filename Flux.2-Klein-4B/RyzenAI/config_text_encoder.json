@@ -31,6 +31,10 @@
             "extra_options": {
                 "filename": "model.onnx"
             }
+        },
+        "model_generation": {
+            "type": "VitisGenerateModelSD",
+            "model_type": "qwen3-4b-text-encoder"
         }
     },
     "log_severity_level": 1,
